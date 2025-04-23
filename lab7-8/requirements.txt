@@ -1,0 +1,4 @@
+locust
+pytest
+selenium
+requests
