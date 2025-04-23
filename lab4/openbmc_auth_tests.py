@@ -15,9 +15,15 @@ INVALID_PASSWORD = "invalid"
 
 @pytest.fixture(scope="module")
 def driver():
-    driver = webdriver.Chrome()
-    driver.get("https://localhost:2443")
-    wait = WebDriverWait(driver, 10)
+    chrome_options = Options()
+    chrome_options.add_argument("--ignore-certificate-errors")
+    chrome_options.add_argument("--disable-gpu")
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--window-size=1920,1080")
+    
+    driver = webdriver.Chrome(options=chrome_options)
+
+    driver.get(LOGIN_URL)
     
     try:
         WebDriverWait(driver, 10).until(
@@ -71,6 +77,3 @@ def test_multiple_auth(driver):
         EC.presence_of_element_located((By.XPATH, "//div[contains(text(), 'Too many failed attempts')]"))
     )
     assert "Too many failed attempts" in error_message.text
-
-if __name__ == "__main__":
-    pytest.main(["-v", "openbmc_auth_tests.py"])
