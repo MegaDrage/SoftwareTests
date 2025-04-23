@@ -15,15 +15,9 @@ INVALID_PASSWORD = "invalid"
 
 @pytest.fixture(scope="module")
 def driver():
-    chrome_options = Options()
-    chrome_options.add_argument("--ignore-certificate-errors")
-    chrome_options.add_argument("--disable-gpu")
-    chrome_options.add_argument("--no-sandbox")
-    chrome_options.add_argument("--window-size=1920,1080")
-    
-    driver = webdriver.Chrome(options=chrome_options)
-
-    driver.get(LOGIN_URL)
+    driver = webdriver.Chrome()
+    driver.get("https://localhost:2443")
+    wait = WebDriverWait(driver, 10)
     
     try:
         WebDriverWait(driver, 10).until(
