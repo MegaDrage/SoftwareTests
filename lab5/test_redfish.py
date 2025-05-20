@@ -2,6 +2,7 @@ import pytest
 import requests
 import os
 import logging
+import time
 from typing import Dict, Any
 from urllib3.exceptions import InsecureRequestWarning
 
