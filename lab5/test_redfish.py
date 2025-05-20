@@ -151,6 +151,6 @@ if __name__ == "__main__":
         "-v", 
         "-s", 
         "--log-cli-level=INFO",
-        "--bmc-host", os.getenv("BMC_HOST", "host.docker.internal"),
+        "--bmc-host", os.getenv("BMC_HOST", "localhost"),
         "--bmc-port", os.getenv("BMC_PORT", "2443")
     ])
