@@ -1,0 +1,177 @@
+pipeline {
+    agent any
+
+    environment {
+        BMC_IP = 'localhost'
+        BMC_PORT = '2443'
+        USERNAME = 'root'
+        PASSWORD = '0penBmc'
+        QEMU_IMAGE_DIR = "${WORKSPACE}/romulus"
+        QEMU_IMAGE_PATTERN = "obmc-phosphor-image-romulus-*.static.mtd"
+        JENKINS_BUILD_URL = "https://jenkins.openbmc.org/job/ci-openbmc/lastSuccessfulBuild/distro=ubuntu,label=docker-builder,target=romulus/artifact/openbmc/build/tmp/deploy/images/romulus/*zip*/romulus.zip"
+        VENV_PATH = "${WORKSPACE}/venv"
+        LOG_DIR = "${WORKSPACE}/logs"
+    }
+
+    stages {
+        stage('Clone Repository') {
+            steps {
+                git branch: 'main', url: 'https://github.com/MegaDrage/SoftwareTests.git'
+            }
+        }
+
+        stage('Setup Environment') {
+            steps {
+                sh 'mkdir -p ${LOG_DIR}'
+                sh '''
+                    apk update --no-cache
+                    apk add --no-cache ca-certificates
+                    apk add --no-cache qemu-system-arm python3 py3-pip chromium chromium-chromedriver gcc python3-dev musl-dev linux-headers
+                    apk add --no-cache perf procps net-tools unzip wget  # Added unzip and wget
+                    # Verify chromedriver is installed
+                    ls -l /usr/bin/chromedriver || echo "Chromedriver not found" | tee -a ${LOG_DIR}/setup.log
+                    # Verify perf and net-tools installation
+                    perf --version || echo "perf not found" | tee -a ${LOG_DIR}/setup.log
+                    netstat --version || echo "net-tools not found" | tee -a ${LOG_DIR}/setup.log
+                '''
+                sh '''
+                    python3 -m venv ${VENV_PATH}
+                    . ${VENV_PATH}/bin/activate
+                    pip3 install --no-cache-dir selenium pytest locust requests psutil
+                '''
+            }
+        }
+
+        stage('Collect Initial Host Metrics') {
+            steps {
+                sh '''
+                    vmstat 1 5 > ${LOG_DIR}/vmstat_initial.log 2>&1
+                    netstat -i > ${LOG_DIR}/netstat_initial.log 2>&1
+                    ps -C qemu-system-arm -o %cpu,%mem || echo "QEMU not running yet" > ${LOG_DIR}/qemu_initial_metrics.log
+                '''
+            }
+        }
+
+        stage('Deploy OpenBMC with QEMU and Profile') {
+            steps {
+                script {
+                    sh '''
+                        # Download and prepare QEMU image
+                        mkdir -p "${QEMU_IMAGE_DIR}"
+                        if [ ! -f "${QEMU_IMAGE_DIR}/${QEMU_IMAGE_PATTERN}" ]; then
+                            echo "Downloading latest image from Jenkins..." | tee -a ${LOG_DIR}/qemu_setup.log
+                            wget "${JENKINS_BUILD_URL}" -O romulus.zip
+                            echo "Unpacking image..." | tee -a ${LOG_DIR}/qemu_setup.log
+                            unzip -o romulus.zip -d "${QEMU_IMAGE_DIR}"
+                            rm romulus.zip
+                        fi
+
+                        # Find QEMU image
+                        QEMU_IMAGE=$(find "${QEMU_IMAGE_DIR}" -name "${QEMU_IMAGE_PATTERN}" | head -n 1)
+                        if [ -z "$QEMU_IMAGE" ]; then
+                            echo "Error: QEMU image not found!" | tee -a ${LOG_DIR}/qemu_setup.log
+                            exit 1
+                        fi
+                        echo "Using QEMU image: $QEMU_IMAGE" | tee -a ${LOG_DIR}/qemu_setup.log
+
+                        # Start QEMU with perf profiling
+                        perf stat -e cycles,instructions,cache-misses -o ${LOG_DIR}/perf_qemu.log \
+                        qemu-system-arm -m 256 -M romulus-bmc -nographic \
+                        -drive file=$QEMU_IMAGE,format=raw,if=mtd -net nic \
+                        -net user,hostfwd=tcp::2222-:22,hostfwd=tcp::2443-:443,hostfwd=udp::2623-:623,hostname=qemu &
+                        echo $! > ${LOG_DIR}/qemu_pid
+                    '''
+                    sh '''
+                        max_attempts=30
+                        wait_time=3
+                        for attempt in $(seq 1 $max_attempts); do
+                            if curl -k -s -o /dev/null -w "%{http_code}" https://localhost:2443/redfish/v1 | grep -q "200"; then
+                                exit 0
+                            fi
+                            sleep $wait_time
+                        done
+                        echo "[$(date +'%Y-%m-%d %H:%M:%S')] Ошибка: BMC не стал доступен" | tee -a ${LOG_DIR}/bmc.log
+                        exit 1
+                    '''
+                }
+            }
+        }
+
+        stage('Collect Metrics During Tests') {
+            steps {
+                sh '''
+                    vmstat 1 > ${LOG_DIR}/vmstat_during_tests.log 2>&1 &
+                    echo $! > ${LOG_DIR}/vmstat_pid
+                    netstat -i -c > ${LOG_DIR}/netstat_during_tests.log 2>&1 &
+                    echo $! > ${LOG_DIR}/netstat_pid
+                    ps -C qemu-system-arm -o %cpu,%mem >> ${LOG_DIR}/qemu_during_tests.log 2>&1 &
+                    echo $! > ${LOG_DIR}/qemu_metrics_pid
+                '''
+            }
+        }
+
+        stage('Run Selenium Authentication Tests') {
+            steps {
+                script {
+                    try {
+                        sh '''
+                            . ${VENV_PATH}/bin/activate
+                            pytest lab4/openbmc_auth_tests.py > ${LOG_DIR}/selenium_auth_tests.log 2>&1
+                        '''
+                    } catch (Exception e) {
+                        echo "Selenium Authentication Tests failed: ${e.getMessage()}. Continuing pipeline..."
+                    }
+                }
+            }
+        }
+
+        stage('Run Redfish API Tests') {
+            steps {
+                script {
+                    try {
+                        sh '''
+                            . ${VENV_PATH}/bin/activate
+                            pytest lab5/test_redfish.py -v > ${LOG_DIR}/redfish_api_tests.log 2>&1
+                        '''
+                    } catch (Exception e) {
+                        echo "Redfish API Tests failed: ${e.getMessage()}. Continuing pipeline..."
+                    }
+                }
+            }
+        }
+
+        stage('Run Locust Load Tests') {
+            steps {
+                script {
+                    try {
+                        sh '''
+                            . ${VENV_PATH}/bin/activate
+                            locust -f lab6/locustfile.py --headless --users 10 --spawn-rate 2 --run-time 1m > ${LOG_DIR}/locust_load_tests.log 2>&1
+                        '''
+                    } catch (Exception e) {
+                        echo "Locust Load Tests failed: ${e.getMessage()}. Continuing pipeline..."
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            sh '''
+                # Terminate background processes
+                [ -f ${LOG_DIR}/qemu_pid ] && kill $(cat ${LOG_DIR}/qemu_pid) || true
+                [ -f ${LOG_DIR}/vmstat_pid ] && kill $(cat ${LOG_DIR}/vmstat_pid) || true
+                [ -f ${LOG_DIR}/netstat_pid ] && kill $(cat ${LOG_DIR}/netstat_pid) || true
+                [ -f ${LOG_DIR}/qemu_metrics_pid ] && kill $(cat ${LOG_DIR}/qemu_metrics_pid) || true
+                pkill -f qemu-system-arm || true
+                pkill -f vmstat || true
+                pkill -f netstat || true
+                # Clean up
+                rm -rf ${QEMU_IMAGE_DIR} || true
+                rm -rf ${VENV_PATH} || true
+            '''
+            archiveArtifacts artifacts: 'logs/*.log', allowEmptyArchive: true
+        }
+    }
+}
